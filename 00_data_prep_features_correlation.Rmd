@@ -1,0 +1,236 @@
+---
+title: "Features & Correlation"
+---
+
+# LIBRARIES
+```{r setup, include=FALSE}
+# api connect
+library(httr)
+
+# sql connect
+library(odbc)
+library(DBI)
+
+# core packages
+library(tidyverse)
+library(timetk)
+library(tidyquant)
+library(janitor)
+library(lubridate)
+library(zoo)
+
+# get data
+library(fredr)
+
+# visualization
+library(gt)
+library(scales)
+library(plotly)
+
+# spreadsheet work
+library(readxl)
+library(openxlsx)
+library(googledrive)
+
+# time series ml
+library(tidymodels)
+library(modeltime)
+library(modeltime.ensemble)
+library(modeltime.resample)
+library(prophet)
+library(rules)
+library(trelliscopejs)
+library(ranger)
+library(randomForest)
+library(recipes)
+
+# Timing & Parallel Processing
+library(tictoc)
+library(future)
+library(doFuture)
+library(parallel)
+library(blastula)
+
+options(scipen=999)
+
+date <- Sys.Date()
+last_full_quarter <- as.Date(round_date(today(), "quarter") - 1)
+
+FRED_API_KEY <- Sys.getenv(FRED_API_KEY)
+
+start_date <- '2019-01-01'
+end_date   <- '2025-12-31'
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# DATA
+```{r}
+data_raw_tbl <- read_rds("00_data/data_raw.rds")
+unemployment_tbl <- read_csv("00_data/unemployment.csv")
+```
+
+
+
+## Unemployment CSV
+```{r}
+data_cleaned <- data_raw_tbl %>%
+  mutate(date = as.Date(date, "%Y-%m-%d")) %>%
+  filter(date >= start_date,
+         date <= end_date) %>%
+  summarize_by_time(
+    .date_var = date, 
+    .by = "month",
+    price = round(mean(price),0)) %>%
+  ungroup()
+
+
+
+unemployment_tbl %>%
+  mutate(year  = str_sub(month, 1, 4),
+         month = str_sub(date, 3, 5),
+         date  = str_glue("{year}-{month}-01") %>% 
+             parse_date_time(orders = "%Y-%b-%d") %>% 
+             ymd()) %>% 
+  relocate(date) %>% 
+  mutate(across(where(is.character), str_squish)) %>%
+  clean_names() %>% 
+  select(date, everything(), -month, -year)
+```
+
+
+
+## Inflation
+```{r, eval=FALSE}
+fred_data <- c("CPIAUCSL")
+
+# FRED data
+pull_series <- function(x, startDate = as.Date("2000-01-01"),
+                          endDate = last_full_quarter,
+                          frequency_ind = "m",
+                          agg_type = "avg") {
+  df <- fredr(series_id = x,
+  observation_start = startDate,
+  observation_end = endDate,
+  frequency = frequency_ind,
+  aggregation_method = agg_type
+  )
+}
+
+macroeconomic_data <- purrr::map_dfr(fred_data, pull_series)
+
+
+macroeconomic_reshaped <- macroeconomic_data %>%
+  select(-realtime_start, -realtime_end) %>%
+  pivot_wider(names_from = series_id, values_from = value) %>%
+  mutate(date = as.Date(date)) %>%
+  clean_names()
+
+
+inflation_rate <- macroeconomic_reshaped %>% select(date, cpiaucsl) %>% rename(inflation = cpiaucsl)
+
+
+inflation <- inflation_rate %>%
+  pad_by_time(date, .by = "month", .pad_value = NA) %>%
+  mutate(inflation = ts_impute_vec(inflation, period = 12))
+```
+
+
+
+
+# 1.0 FEATURES & CORRELATION
+## - Unemployment Rate
+Features
+```{r, include=FALSE}
+unemployment_features_monthly_tbl <- unemployment_tbl %>%
+  mutate(unemployment = diff_vec(unemployment, silent = TRUE)) %>%
+  drop_na() %>%
+  tk_tsfeatures(
+    .date_var = date,
+    .value    = unemployment,
+    .features = c("median", "frequency", "entropy", "stl_features", "acf_features", "ac_9")
+  ) %>%
+  glimpse()
+
+
+
+unemployment_features_quarterly_tbl <- unemployment_tbl %>%
+  mutate(date_rounded = round_date(date, "quarter")) %>%
+  group_by(date_rounded) %>%
+  tk_tsfeatures(
+    .date_var = date,
+    .value    = unemployment,
+    .features = c("median", "frequency", "entropy", "stl_features", "acf_features", "ac_9"),
+    .prefix   = "emp_"
+  ) %>%
+  ungroup() %>%
+  select_if(~ !any(is.na(.)))
+```
+
+Correlation
+```{r, eval=FALSE}
+data_cleaned %>%
+  mutate(date_rounded = round_date(date, "quarter")) %>%
+  left_join(unemployment_features_quarterly_tbl, by = c("date_rounded")) %>%
+  select(-date, -date_rounded) %>%
+  cor() %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  as_tibble() %>%
+  select(rowname, price) %>%
+  arrange(desc(abs(price)))
+```
+
+
+
+
+## - Inflation
+Features
+```{r, include=FALSE}
+inflation_features_monthly_tbl <- inflation %>%
+  mutate(inflation = diff_vec(inflation, silent = TRUE)) %>%
+  drop_na() %>%
+  tk_tsfeatures(
+    .date_var = date,
+    .value    = inflation,
+    .features = c("median", "frequency", "entropy", "stl_features", "acf_features", "ac_9")
+  ) %>%
+  glimpse()
+
+
+
+inflation_features_quarterly_tbl <- inflation %>%
+  mutate(date_rounded = round_date(date, "quarter")) %>%
+  group_by(date_rounded) %>%
+  tk_tsfeatures(
+    .date_var = date,
+    .value    = inflation,
+    .features = c("median", "frequency", "entropy", "stl_features", "acf_features", "ac_9"),
+    .prefix   = "cpi_"
+  ) %>%
+  ungroup() %>%
+  select_if(~ !any(is.na(.)))
+```
+
+Correlation
+```{r, eval=FALSE}
+data_cleaned %>%
+  mutate(date_rounded = round_date(date, "quarter")) %>%
+  left_join(inflation_features_quarterly_tbl, by = c("date_rounded")) %>%
+  select(-date, -date_rounded) %>%
+  cor() %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  as_tibble() %>%
+  select(rowname, price) %>%
+  arrange(desc(abs(price)))
+```
+
+
+
+
+# 2.0 SAVE RDS
+```{r}
+write_rds(unemployment_features_quarterly_tbl, "00_data/unemployment_features_quarterly_tbl.rds")
+write_rds(inflation_features_quarterly_tbl, "00_data/inflation_features_quarterly_tbl.rds")
+```

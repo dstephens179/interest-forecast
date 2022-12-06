@@ -1,0 +1,986 @@
+---
+title: "Global Forecast: Mortgage Rates"
+---
+
+
+# LIBRARIES
+```{r setup, include=FALSE}
+# api connect
+library(httr)
+
+# sql connect
+library(odbc)
+library(DBI)
+
+# core packages
+library(tidyverse)
+library(timetk)
+library(tidyquant)
+library(janitor)
+library(lubridate)
+library(zoo)
+
+# get data
+library(fredr)
+
+# visualization
+library(gt)
+library(scales)
+library(plotly)
+
+# spreadsheet work
+library(readxl)
+library(openxlsx)
+library(googledrive)
+
+# time series ml
+library(tidymodels)
+library(modeltime)
+library(modeltime.ensemble)
+library(modeltime.resample)
+library(prophet)
+library(rules)
+library(trelliscopejs)
+library(ranger)
+library(randomForest)
+library(recipes)
+library(kknn)
+library(Cubist)
+
+# Timing & Parallel Processing
+library(future)
+library(doFuture)
+library(parallel)
+library(blastula)
+library(bundle)
+
+options(scipen=999)
+
+date <- today()
+day_of_month <- format(today(), format = "%d")
+
+prior_month <- floor_date(today(), "months") - months(1)
+current_month <- floor_date(today(), "months")
+
+end_date <- as_date(ifelse(day_of_month <= 20, prior_month, current_month))
+end_date_forecast <- as.Date('2025-12-31')
+
+horizon <- interval(end_date, end_date_forecast) %/% months(1)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+# --
+# 0.0 DATA
+## Pull FRED Data
+```{r}
+fred_data <- c("MORTGAGE30US", 
+               "DFF",
+               "DGS10")
+
+# Get Data from FRED
+pull_series <- function(x, startDate = as.Date("1970-01-01"),
+                          endDate = today(),
+                          frequency_ind = "m",
+                          agg_type = "avg") {
+  df <- fredr(series_id = x,
+  observation_start = startDate,
+  observation_end = endDate,
+  frequency = frequency_ind,
+  aggregation_method = agg_type
+  )
+}
+
+macroeconomic_data <- purrr::map_dfr(fred_data, pull_series)
+```
+
+
+## Reshape Data
+```{r}
+data_cleaned <- macroeconomic_data %>%
+  select(-realtime_start, -realtime_end) %>%
+  pivot_wider(names_from = series_id, values_from = value) %>%
+  mutate(date = as.Date(date)) %>%
+  clean_names() %>%
+  filter(date >= '1972-01-01',
+         date <= end_date)
+
+
+macroeconomic_data %>%
+    plot_time_series(
+        date,
+        value,
+        .color_var = series_id, 
+        .smooth = FALSE
+    )
+
+
+# mortgage rate
+mortgage_rate <- data_cleaned %>% select(date, mortgage30us)
+
+mortgage_rate %>%
+  plot_time_series(date, mortgage30us, .title = "Mortgage Rate Actuals")
+
+
+# fed fund rate
+ffr <- data_cleaned %>% 
+    select(date, dff) %>%
+      add_row(date = ymd('2022-12-01'), dff = 4.4) %>%
+      add_row(date = ymd('2023-12-01'), dff = 4.6) %>%
+      add_row(date = ymd('2024-12-01'), dff = 3.9) %>%
+      add_row(date = ymd('2025-12-01'), dff = 2.9) %>%
+      arrange(date) %>%
+      pad_by_time(.date_var = date, .by = "month", .pad_value = NA) %>%
+      mutate(dff = ts_impute_vec(dff, period = 12))
+    
+
+ffr %>%
+  plot_time_series(date, dff, .title = "FFR Actuals+Forecast")
+
+
+# 10-year treasuries: forecast from https://econforecasting.com/forecast-t10y
+treasury <- data_cleaned %>% 
+  select(date, dgs10) %>%
+  filter(date < '2022-10-01') %>%
+  add_row(date = ymd('2022-12-01'), dgs10 = 4.23) %>%
+  add_row(date = ymd('2023-06-01'), dgs10 = 5.08) %>%
+  add_row(date = ymd('2023-12-01'), dgs10 = 4.71) %>%
+  add_row(date = ymd('2024-12-01'), dgs10 = 3.87) %>%
+  add_row(date = ymd('2025-12-01'), dgs10 = 3.66) %>%
+  arrange(date) %>%
+  pad_by_time(.date_var = date, .by = "month", .pad_value = NA) %>%
+  mutate(dgs10 = ts_impute_vec(dgs10, period = 12))
+  
+treasury %>%
+  plot_time_series(date, dgs10, .title = "10-Year Treasuries + Forecast")
+```
+
+
+## Plot ACF Diagnostics
+```{r}
+mortgage_rate %>% 
+  plot_acf_diagnostics(.date_var = date, .value = diff_vec(mortgage30us))
+```
+
+
+# --
+# 1.0 PREPARE DATA
+## Create full dataset
+```{r}
+full_data_tbl <- mortgage_rate %>%
+  
+  # pad by time to add zeros in blank dates
+  pad_by_time(
+    .date_var = date,
+    .by = "month",
+    .pad_value = 0,
+    .end_date = end_date,
+  ) %>%
+  
+  future_frame(
+    .date_var = date, 
+    .length_out = horizon,
+    .bind_data = TRUE) %>%
+  
+  # lags & rolling features
+  tk_augment_fourier(date, .periods = c(3, 6, 12)) %>%
+  tk_augment_lags(mortgage30us, .lags = horizon) %>%
+  tk_augment_slidify(
+    str_glue("mortgage30us_lag{horizon}"),
+    .f       = ~ mean(., na.rm = TRUE),
+    .period  = c(5, 9, 22, 67, 79, 85, 90),
+    .partial = TRUE,
+    .align   = "center"
+  ) %>%
+  
+  # join fed fund rate, and 10-year treasuries data
+  left_join(ffr, by = "date") %>%
+  left_join(treasury, by = "date") %>%
+  
+  filter(!is.na(str_glue("mortgage30us_lag{horizon}")))
+```
+
+
+## Split into future & prepared
+```{r}
+monthly_prepared_tbl <- full_data_tbl %>%
+  filter(!is.na(mortgage30us)) %>%
+  drop_na()
+
+monthly_forecast_tbl <- full_data_tbl %>%
+  filter(is.na(mortgage30us))
+```
+
+
+
+
+# --
+# 2.0 TRAIN / TEST
+```{r}
+splits <- monthly_prepared_tbl %>%
+  time_series_split(
+    date_var = date, 
+    assess = horizon,
+    cumulative = TRUE)
+
+splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    .date_var = date,
+    .value    = mortgage30us)
+```
+
+
+
+# --
+# 3.0 RECIPES
+```{r, include=FALSE}
+# for sequential models
+recipe_spec <- recipe(mortgage30us ~ ., data = training(splits)) %>%
+  step_timeseries_signature(date) %>%
+  step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(am.pm)")) %>%
+  step_normalize(matches("(index.num)|(year)|(yday)")) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+recipe_spec %>% 
+  prep() %>%
+  juice() %>%
+  glimpse()
+
+
+# for non-sequential models
+recipe_spec_ml <- recipe(mortgage30us ~ ., data = training(splits)) %>%
+  step_timeseries_signature(date) %>%
+  step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(am.pm)")) %>%
+  step_normalize(matches("(index.num)|(year)|(yday)")) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%
+  step_rm(date)
+
+recipe_spec_ml %>% 
+  prep() %>%
+  juice() %>%
+  glimpse()
+```
+
+
+
+
+# --
+# 4.0 MODELS
+## Parallel Processing
+```{r}
+registerDoFuture()
+plan(strategy = cluster,
+     workers  = parallel::makeCluster(16))
+```
+
+
+
+```{r}
+# * XGBoost Models
+set.seed(123)
+wflw_fit_xgb_1 <- workflow() %>%
+  add_model(boost_tree(
+    mode = "regression",
+    mtry = 25, 
+    trees = 1000, 
+    min_n = 2, 
+    tree_depth = 12, 
+    learn_rate = 0.3, 
+    loss_reduction = 0
+  ) %>%
+    set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_ml) %>%
+  fit(training(splits))
+
+wflw_fit_xgb_2 <- workflow() %>%
+  add_model(boost_tree("regression", learn_rate = 0.50) %>% set_engine("xgboost")) %>%
+  add_recipe(recipe_spec_ml) %>%
+  fit(training(splits))
+
+
+
+# * Random Forest
+set.seed(123)
+wflw_fit_rf <- workflow() %>%
+  add_model(rand_forest(
+    mode = "regression", 
+    mtry = 25, 
+    trees = 1000, 
+    min_n = 25
+  ) %>%
+    set_engine("randomForest")) %>%
+  add_recipe(recipe_spec_ml) %>%
+  fit(training(splits))
+
+
+
+# * Prophet Boost
+wflw_fit_prophet_boost <- workflow() %>%
+  add_model(
+      # turn off all seasonality, as xgboost will pick this up
+      spec = prophet_boost(
+          seasonality_daily  = FALSE, 
+          seasonality_weekly = FALSE, 
+          seasonality_yearly = FALSE
+      ) %>% 
+          set_engine("prophet_xgboost")
+  ) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+
+
+# * THIEF - Temporal Hierarchical Forecasting (Rob H & Co.)
+wflw_fit_thief <- workflow() %>%
+  add_model(temporal_hierarchy() %>% set_engine("thief")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+
+
+# * GLMNet
+wflw_fit_glmnet <- workflow() %>%
+  add_model(
+    linear_reg(
+      mode = "regression", 
+      penalty = 0.01, 
+      mixture = 0) %>% 
+    set_engine("glmnet")) %>%
+  add_recipe(recipe_spec_ml) %>%
+  fit(training(splits))
+
+
+
+# * MARS
+wflw_fit_mars <- workflow() %>%
+  add_model(mars(
+    mode = "regression", 
+    num_terms = 10
+  ) %>% 
+    set_engine("earth", endspan = 200)) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+
+
+# SVM Poly
+wflw_fit_svm_poly <- workflow() %>%
+  add_model(svm_poly(
+    mode = "regression", 
+    cost = 10, 
+    degree = 1,
+    scale_factor = 1,
+    margin = 0.1
+  ) %>%
+    set_engine("kernlab")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+
+
+# SVM Radial
+wflw_fit_svm_rdl <- workflow() %>%
+  add_model(svm_rbf(
+    mode = "regression",
+    cost = 1, 
+    rbf_sigma = 0.01,
+    margin = 0.1
+  ) %>%
+    set_engine("kernlab")) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+
+
+# K-Nearest Neighbors
+set.seed(123)
+wflw_fit_knn <- workflow() %>%
+  add_model(nearest_neighbor(
+    mode = "regression",
+    neighbors = 50, 
+    dist_power = 10, 
+    weight_func = "optimal"
+  ) %>%
+    set_engine("kknn")) %>%
+  add_recipe(recipe_spec_ml) %>%
+  fit(training(splits))
+
+
+
+# Cubist
+set.seed(123)
+wflw_fit_cubist <- workflow() %>%
+    add_model(cubist_rules(
+    committees = 50, 
+    neighbors = 7, 
+    max_rules = 100
+  ) %>%
+    set_engine("Cubist")) %>%
+    add_recipe(recipe_spec_ml) %>%
+    fit(training(splits))
+
+
+
+# Neural Net
+set.seed(123)
+wflw_fit_nnet <- workflow() %>%
+    add_model(mlp(
+    mode = "regression",
+    hidden_units = 10,
+    penalty = 1, 
+    epochs = 100
+  ) %>%
+    set_engine("nnet")) %>%
+    add_recipe(recipe_spec_ml) %>%
+    fit(training(splits))
+
+
+
+# NNETAR
+set.seed(123)
+wflw_fit_nnetar <- workflow() %>%
+    add_model(nnetar_reg(
+    non_seasonal_ar = 2,
+    seasonal_ar     = 1, 
+    hidden_units    = 10,
+    penalty         = 10,
+    num_networks    = 10,
+    epochs          = 50
+  ) %>%
+    set_engine("nnetar")) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits) %>% drop_na())
+```
+
+
+## Accuracy Check
+```{r}
+# * ACCURACY CHECK ----
+submodels_1_tbl <- modeltime_table(
+  wflw_fit_xgb_1,
+  wflw_fit_xgb_2,
+  wflw_fit_rf,
+  wflw_fit_prophet_boost,
+  wflw_fit_thief,
+  wflw_fit_glmnet,
+  wflw_fit_mars,
+  wflw_fit_svm_poly,
+  wflw_fit_svm_rdl,
+  wflw_fit_knn,
+  wflw_fit_cubist,
+  wflw_fit_nnet,
+  wflw_fit_nnetar
+) %>%
+  update_model_description(1, "xbg 1") %>%
+  update_model_description(2, "xgb 2") %>%
+  update_model_description(3, "rf") %>%
+  update_model_description(4, "prophet boost") %>%
+  update_model_description(5, "thief") %>%
+  update_model_description(6, "glmnet") %>%
+  update_model_description(7, "mars") %>%
+  update_model_description(8, "svm poly") %>%
+  update_model_description(9, "svm rdl") %>%
+  update_model_description(10, "knn") %>%
+  update_model_description(11, "cubist") %>%
+  update_model_description(12, "nnet") %>%
+  update_model_description(13, "nnetar") 
+
+
+# calibrate on testing data
+submodels_calibrate <- submodels_1_tbl %>%
+  modeltime_calibrate(new_data = testing(splits)) 
+
+
+# GLOBAL accuracy
+submodels_calibrate %>%
+  modeltime_accuracy(acc_by_id = FALSE) %>%
+  arrange(rmse)
+```
+
+
+
+# 4.1 MODELS w/ TUNE
+## Resamples
+```{r}
+# K-Fold: Non-Sequential Models
+set.seed(123)
+resamples_kfold <- training(splits) %>% vfold_cv(v = 10)
+
+
+# visualize the 10 folds (90/10 testing)
+resamples_kfold %>%
+    tk_time_series_cv_plan() %>%
+    plot_time_series_cv_plan(date, mortgage30us, .facet_ncol = 2)
+
+
+# TS Cross Validation: Sequential Models
+resamples_tscv <- time_series_cv(
+  data        = training(splits) %>% drop_na(),
+  cumulative  = TRUE,
+  assess      = 50,
+  skip        = 25,
+  slice_limit = 10
+)
+
+
+resamples_tscv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(.date_var = date, .value = mortgage30us)
+```
+
+
+## XGBoost Tune
+```{r}
+model_spec_xgboost_tune <- boost_tree(
+    mode            = "regression", 
+    mtry            = tune(),
+    trees           = tune(),
+    min_n           = tune(),
+    tree_depth      = tune(),
+    learn_rate      = tune(),
+    loss_reduction  = tune()
+) %>% 
+    set_engine("xgboost")
+
+wflw_spec_xgboost_tune <- workflow() %>%
+    add_model(model_spec_xgboost_tune) %>%
+    add_recipe(recipe_spec_ml)
+
+
+# Tuning
+set.seed(123)
+tune_results_xgboost <- wflw_spec_xgboost_tune %>%
+    tune_grid(
+        resamples  = resamples_kfold,
+        param_info = parameters(wflw_spec_xgboost_tune) %>%
+            update(
+                learn_rate = learn_rate(range = c(0.001, 0.400), trans = NULL)
+            ),
+        grid = 10,
+        control = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+
+
+# ** Results
+tune_results_xgboost %>% show_best("rmse", n = Inf)
+
+
+# ** Finalize
+set.seed(123)
+wflw_fit_xgboost_tuned <- wflw_spec_xgboost_tune %>%
+  finalize_workflow(select_best(tune_results_xgboost, "rmse")) %>%
+  fit(training(splits))
+```
+
+
+## RF Tune
+```{r, include=FALSE}
+model_spec_rf_tune <- rand_forest(
+    mode    = "regression",
+    mtry    = tune(),
+    trees   = tune(),
+    min_n   = tune()
+) %>% 
+    set_engine("randomForest")
+
+wflw_spec_rf_tune <- workflow() %>%
+    add_model(model_spec_rf_tune) %>%
+    add_recipe(recipe_spec_ml)
+
+
+# ** Tuning
+set.seed(123)
+tune_results_rf <- wflw_spec_rf_tune %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = 5,
+        control   = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+
+
+# ** Results
+best_rf_tuned <- tune_results_rf %>% show_best("rmse", n = Inf)
+
+
+# ** Finalize
+set.seed(123)
+wflw_fit_rf_tuned <- wflw_spec_rf_tune %>%
+  finalize_workflow(select_best(tune_results_rf, "rmse")) %>%
+  fit(training(splits))
+```
+
+
+## KNN Tune
+```{r, include=FALSE}
+model_spec_knn_tune <- nearest_neighbor(
+    mode        = "regression",
+    neighbors   = tune(), 
+    dist_power  = tune(), 
+    weight_func = "optimal"
+) %>%
+    set_engine("kknn")
+
+wflw_spec_knn_tune <- workflow() %>%
+    add_model(model_spec_knn_tune) %>%
+    add_recipe(recipe_spec_ml)
+
+
+# ** Tuning
+set.seed(123)
+tune_results_knn <- wflw_spec_knn_tune %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = 5,
+        control   = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+
+
+# ** Results
+best_knn_tuned <- tune_results_knn %>% show_best("rmse", n = Inf)
+
+
+# ** Finalize
+set.seed(123)
+wflw_fit_knn_tuned <- wflw_spec_knn_tune %>%
+  finalize_workflow(select_best(tune_results_knn, "rmse")) %>%
+  fit(training(splits))
+```
+
+
+## Cubist Tune
+```{r, include=FALSE}
+model_spec_cubist_tune <- cubist_rules(
+    committees = tune(),
+    neighbors  = tune(), 
+    max_rules  = tune()
+  ) %>%
+    set_engine("Cubist")
+
+wflw_spec_cubist_tune <- workflow() %>%
+    add_model(model_spec_cubist_tune) %>%
+    add_recipe(recipe_spec_ml)
+
+
+# ** Tuning
+set.seed(123)
+tune_results_cubist <- wflw_spec_cubist_tune %>%
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = 5,
+        control   = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+
+
+# ** Results
+best_cubist_tuned <- tune_results_cubist %>% show_best("rmse", n = Inf)
+
+
+# ** Finalize
+set.seed(123)
+wflw_fit_cubist_tuned <- wflw_spec_cubist_tune %>%
+  finalize_workflow(select_best(tune_results_cubist, "rmse")) %>%
+  fit(training(splits))
+```
+
+
+## SVM Poly Tune
+```{r, include=FALSE}
+model_spec_svm_tune <- svm_poly(
+    mode         = "regression", 
+    cost         = tune(), 
+    degree       = tune(),
+    scale_factor = tune(),
+    margin       = tune()
+) %>%
+    set_engine("kernlab")
+
+
+# ** create latin hypercube grid
+set.seed(123)
+grid_spec_svm <- grid_latin_hypercube(
+  parameters(model_spec_svm_tune),
+  size = 15)
+
+wflw_spec_svm_tune <- workflow() %>%
+    add_model(model_spec_svm_tune) %>%
+    add_recipe(recipe_spec)
+
+
+# ** Tuning
+set.seed(123)
+tune_results_svm <- wflw_spec_svm_tune %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_svm,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = TRUE, allow_par = TRUE, save_pred = TRUE))
+
+
+# ** Results
+best_svm_tuned <- tune_results_svm %>% show_best("rmse", n = Inf)
+
+
+# ** Finalize
+set.seed(123)
+wflw_fit_svm_tuned <- wflw_spec_svm_tune %>%
+  finalize_workflow(select_best(tune_results_svm, "rmse")) %>%
+  fit(training(splits))
+```
+
+
+## NNETAR Tune
+```{r, eval=FALSE}
+model_spec_nnetar_tune <- nnetar_reg(
+    non_seasonal_ar = tune(id = "non_seasonal_ar"),
+    seasonal_ar     = tune(), 
+    hidden_units    = tune(),
+    penalty         = tune(),
+    num_networks    = tune(),
+    epochs          = tune()
+) %>%
+    set_engine("nnetar")
+
+# ** create latin hypercube grid
+set.seed(123)
+grid_spec_nnetar_1 <- grid_latin_hypercube(
+  parameters(model_spec_nnetar_tune),
+  size = 15)
+
+wflw_spec_nnetar_tune <- workflow() %>%
+    add_model(model_spec_nnetar_tune) %>%
+    add_recipe(recipe_spec)
+
+
+# ** Tuning
+set.seed(123)
+tune_results_nnetar_1 <- wflw_spec_nnetar_tune %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_nnetar_1,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = TRUE, allow_par = TRUE, save_pred = TRUE))
+
+
+# ** Results
+best_nnetar_tuned_1 <- tune_results_nnetar_1 %>% show_best("rmse", n = Inf)
+
+
+# visualize
+g <- tune_results_nnetar_1 %>%
+  autoplot() +
+  geom_smooth(se = FALSE)
+ggplotly(g)
+
+
+# ** fine-tune latin hypercube grid
+set.seed(123)
+grid_spec_nnetar_2 <- grid_latin_hypercube(
+  non_seasonal_ar(range = c(1,2)),
+  seasonal_ar(range = c(2, 2)),
+  hidden_units(range = c(4, 10)),
+  penalty(range = c(-5.8, -1), trans = scales::log10_trans()),
+  epochs(range = c(717, 930)),
+  num_networks(range = c(5, 35)),
+  size = 15)
+
+
+# ** Tuning
+set.seed(123)
+tune_results_nnetar_2 <- wflw_spec_nnetar_tune %>%
+    tune_grid(
+        resamples = resamples_tscv,
+        grid      = grid_spec_nnetar_2,
+        metrics   = default_forecast_accuracy_metric_set(),
+        control   = control_grid(verbose = TRUE, allow_par = TRUE, save_pred = TRUE))
+
+
+# ** Results
+best_nnetar_tuned_2 <- tune_results_nnetar_2 %>% show_best("rmse", n = Inf)
+
+
+# ** Finalize
+set.seed(123)
+wflw_fit_nnetar_tuned <- wflw_spec_nnetar_tune %>%
+  finalize_workflow(select_best(tune_results_nnetar_2, "rmse")) %>%
+  fit(training(splits))
+```
+
+
+
+
+# --
+# 5.0 EVALUATE FORECAST
+## Combine tuned & submodels
+```{r}
+submodels_2_tbl <- modeltime_table(
+  wflw_fit_xgboost_tuned,
+  wflw_fit_rf_tuned,
+  wflw_fit_knn_tuned,
+  wflw_fit_svm_tuned,
+  wflw_fit_cubist_tuned
+) %>%
+  update_model_description(1, "xgboost tuned") %>%
+  update_model_description(2, "rf tuned") %>%
+  update_model_description(3, "knn tuned") %>%
+  update_model_description(4, "svm tuned") %>%
+  update_model_description(5, "cubist tuned") %>%
+  combine_modeltime_tables(submodels_1_tbl)
+
+
+# calibrate
+calibration_tbl <- submodels_2_tbl %>%
+  modeltime_calibrate(new_data = testing(splits))
+
+
+# GLOBAL accuracy
+calibration_tbl %>%
+  modeltime_accuracy(acc_by_id = FALSE) %>%
+  arrange(rmse)
+
+
+# visualize
+calibration_tbl %>%
+  modeltime_forecast(
+    new_data    = testing(splits),
+    actual_data = monthly_prepared_tbl,
+    keep_data   = TRUE 
+  ) %>%
+    plot_modeltime_forecast(
+        .conf_interval_show = FALSE,
+        .interactive        = TRUE,
+        .title = "All Models during Testing")
+```
+
+
+## Select best models, create ensemble and test
+```{r}
+# Average Ensemble
+submodels_to_keep <- c("svm poly", "cubist tuned", "mars", "xgboost tuned")
+
+# ensemble using median between all models
+ensemble_fit <- submodels_2_tbl %>%
+    filter(.model_desc %in% submodels_to_keep) %>%
+    ensemble_average(type = "median")
+
+# modeltime table
+best_models_tbl <- modeltime_table(
+  ensemble_fit
+) %>%
+  update_model_description(1, "ensemble") %>%
+  combine_modeltime_tables(submodels_2_tbl)
+
+
+# calibrate
+calibration_best_tbl <- best_models_tbl %>%
+  modeltime_calibrate(new_data = testing(splits))
+
+
+# GLOBAL accuracy
+calibration_best_tbl %>%
+  modeltime_accuracy(acc_by_id = FALSE,
+                     metric_set = metric_set(mae, rmse, rsq)) %>%
+  arrange(rmse)
+
+
+# visualize
+calibration_best_tbl %>%
+  modeltime_forecast(
+    new_data    = testing(splits),
+    actual_data = monthly_prepared_tbl,
+    keep_data   = TRUE 
+  ) %>%
+    plot_modeltime_forecast(
+        .conf_interval_show = FALSE,
+        .interactive        = TRUE,
+        .title = "All Models during Testing")
+```
+
+
+
+## FORECAST
+```{r}
+# Refit on entire monthly_joined_prepared_tbl data
+model_refit_tbl <- calibration_best_tbl %>%
+    modeltime_refit(data = monthly_prepared_tbl)
+
+
+# forecast on the future data
+forecast_top_models_tbl <- model_refit_tbl %>%
+    modeltime_forecast(
+        new_data    = monthly_forecast_tbl,
+        actual_data = monthly_prepared_tbl,
+        keep_data   = TRUE,
+        conf_by_id  = FALSE)
+
+
+# visualize
+forecast_top_models_tbl %>%
+    plot_modeltime_forecast(.conf_interval_show = FALSE,
+                            .title = "Mortgage Rate (including FFR and 10-Year Treasuries)")
+```
+
+
+
+
+# --
+# 6.0 SAVE ARTIFACTS
+```{r}
+###### SAVE BEST MODEL ######
+best_mortgage_model <- forecast_top_models_tbl %>%
+  filter(.model_desc   == "ensemble"
+         | .model_desc == "ACTUAL") %>%
+  rename(mortgage = .value) %>%
+  select(date, .model_desc, .key, mortgage, .conf_lo, .conf_hi, dff, dgs10)
+
+
+# save as RDS files
+write_rds(best_mortgage_model, "00_models/best_model_global_forecast_mortgage_rate.rds")
+write_rds(best_mortgage_model, str_glue("00_archive/{date}_best_model_global_forecast_mortgage_rate.rds"))
+
+
+
+
+###### SAVE TOP MODELS ######
+top_mortgage_models <- forecast_top_models_tbl %>%
+  filter(.model_desc   == "svm poly"
+         | .model_desc == "mars"
+         | .model_desc == "cubist tuned"
+         | .model_desc == "xgboost tuned"
+         | .model_desc == "ensemble"
+         | .model_desc == "ACTUAL") %>%
+  rename(mortgage = .value) %>%
+  select(date, .model_desc, .key, mortgage, .conf_lo, .conf_hi)
+
+# save as RDS files
+write_rds(top_mortgage_models, "00_models/all_models_global_forecast_mortgage_rate.rds")
+write_rds(forecast_top_models_tbl, str_glue("00_archive/{date}_all_models_global_forecast_mortgage_rate.rds"))
+```
+
+
+## Review with FFR
+```{r}
+mortgage_ffr_treasury_model <- best_mortgage_model %>%
+  select(date, mortgage) %>%
+  left_join(treasury, by = "date") %>%
+  left_join(ffr, by = "date")
+  
+mortgage_ffr_treasury_model %>%
+  pivot_longer(-date) %>%
+  plot_time_series(date, value, .color_var = name, .smooth = FALSE, .title = "Forecast: Mortgage, 10-Year Treasuries & FFR")
+
+write_rds(mortgage_ffr_treasury_model, "00_models/03_forecast_mortgage_ffr.rds")
+```
+
+
+
+# --
+# Turn off Parallel Processing
+```{r}
+plan(strategy = sequential)
+```
