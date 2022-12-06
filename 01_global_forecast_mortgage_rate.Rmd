@@ -46,6 +46,7 @@ library(randomForest)
 library(recipes)
 library(kknn)
 library(Cubist)
+library(vip)
 
 # Timing & Parallel Processing
 library(future)
@@ -276,7 +277,7 @@ recipe_spec_ml %>%
 ```{r}
 registerDoFuture()
 plan(strategy = cluster,
-     workers  = parallel::makeCluster(16))
+     workers  = parallel::makeCluster(6))
 ```
 
 
@@ -825,7 +826,7 @@ submodels_2_tbl <- modeltime_table(
   wflw_fit_svm_tuned,
   wflw_fit_cubist_tuned
 ) %>%
-  update_model_description(1, "xgboost tuned") %>%
+  update_model_description(1, "xgb tuned") %>%
   update_model_description(2, "rf tuned") %>%
   update_model_description(3, "knn tuned") %>%
   update_model_description(4, "svm tuned") %>%
@@ -861,7 +862,7 @@ calibration_tbl %>%
 ## Select best models, create ensemble and test
 ```{r}
 # Average Ensemble
-submodels_to_keep <- c("svm poly", "cubist tuned", "mars", "xgboost tuned")
+submodels_to_keep <- c("svm poly", "cubist tuned", "mars", "xgb tuned")
 
 # ensemble using median between all models
 ensemble_fit <- submodels_2_tbl %>%
@@ -927,6 +928,30 @@ forecast_top_models_tbl %>%
 
 
 
+## VIP
+```{r}
+# xgb tuned explained
+xgb_importance <- vip::vi(wflw_fit_xgboost_tuned$fit$fit$fit)
+vip(xgb_importance)
+
+
+# mars explained
+mars_importance <- vip::vi(wflw_fit_mars$fit$fit$fit)
+vip(mars_importance)
+
+
+# cubist tuned explained
+cubist_tuned_importance <- vip::vi(wflw_fit_cubist_tuned$fit$fit$fit)
+vip(cubist_tuned_importance)
+
+
+# glmnet explained
+glmnet_importance <- vip::vi(wflw_fit_glmnet$fit$fit$fit)
+vip(glmnet_importance)
+```
+
+
+
 
 # --
 # 6.0 SAVE ARTIFACTS
@@ -972,9 +997,14 @@ mortgage_ffr_treasury_model <- best_mortgage_model %>%
   
 mortgage_ffr_treasury_model %>%
   pivot_longer(-date) %>%
-  plot_time_series(date, value, .color_var = name, .smooth = FALSE, .title = "Forecast: Mortgage, 10-Year Treasuries & FFR")
+  plot_time_series(
+    date, 
+    value, 
+    .color_var = name, 
+    .smooth = FALSE,
+    .title = "Forecast: Mortgage, 10-Year Treasuries & FFR")
 
-write_rds(mortgage_ffr_treasury_model, "00_models/03_forecast_mortgage_ffr.rds")
+write_rds(mortgage_ffr_treasury_model, "00_models/forecast_mortgage_ffr.rds")
 ```
 
 
@@ -984,3 +1014,8 @@ write_rds(mortgage_ffr_treasury_model, "00_models/03_forecast_mortgage_ffr.rds")
 ```{r}
 plan(strategy = sequential)
 ```
+
+
+
+
+
