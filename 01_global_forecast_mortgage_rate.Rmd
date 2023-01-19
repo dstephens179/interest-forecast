@@ -932,22 +932,22 @@ forecast_top_models_tbl %>%
 ```{r}
 # xgb tuned explained
 xgb_importance <- vip::vi(wflw_fit_xgboost_tuned$fit$fit$fit)
-vip(xgb_importance)
+vip(xgb_importance, geom = "point")
 
 
 # mars explained
 mars_importance <- vip::vi(wflw_fit_mars$fit$fit$fit)
-vip(mars_importance)
+vip(mars_importance, geom = "point")
 
 
 # cubist tuned explained
 cubist_tuned_importance <- vip::vi(wflw_fit_cubist_tuned$fit$fit$fit)
-vip(cubist_tuned_importance)
+vip(cubist_tuned_importance, geom = "point")
 
 
 # glmnet explained
 glmnet_importance <- vip::vi(wflw_fit_glmnet$fit$fit$fit)
-vip(glmnet_importance)
+vip(glmnet_importance, geom = "point")
 ```
 
 
