@@ -1,6 +1,7 @@
 # Interest Forecast
 ## Showcasing 30-Year Mortgage Rate Forecast
 
+![alt text](https://github.com/dstephens179/interest-forecast/blob/main/mortgage_10-year-treasuries_ffr.png)
 
 
 **Data Prep for Features & Corrleation**
