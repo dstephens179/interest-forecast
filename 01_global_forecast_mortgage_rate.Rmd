@@ -22,6 +22,10 @@ library(zoo)
 
 # get data
 library(fredr)
+library(rvest)
+library(RSelenium)
+library(netstat)
+library(fs)
 
 # visualization
 library(gt)
@@ -76,6 +80,51 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # --
 # 0.0 DATA
+## Harvest: 10-Year Treasuries Forecast
+```{r}
+rs_driver_object <- rsDriver(browser = 'chrome',
+                             chromever = '108.0.5359.71',
+                             verbose = F,
+                             port = free_port())
+
+remDr <- rs_driver_object$client
+remDr$navigate("https://econforecasting.com/forecast-t10y")
+
+
+# make sure market consensus is selected
+market_consensus <- remDr$findElement(using = 'xpath', '//li[@data-ref-table = "int"]')
+market_consensus$clickElement()
+
+
+# find buttons and click download (2 element)
+download_button <- remDr$findElement(using = 'xpath', '(//button[@aria-controls = "table-int"])[2]')
+download_button$clickElement()
+```
+
+
+Close selenium separately
+Download should have a chance to complete.
+```{r}
+# close selenium server
+remDr$close()
+system("taskkill /im java.exe /f")
+
+```
+
+
+Relocate downloaded file
+```{r}
+file_move(path = "C:\\Users\\nidst\\Downloads\\10 Year Treasury Yield Forecast  Economic Forecasts  econforecasting.com.csv",
+          new_path = "C:\\Users\\nidst\\Desktop\\GitHub\\interest-forecast\\00_data\\10 Year Treasury Yield Forecast  Economic Forecasts  econforecasting.com.csv")
+
+
+dgs10_forecast <- read_csv("00_data/10 Year Treasury Yield Forecast  Economic Forecasts  econforecasting.com.csv") %>%
+  rename(date = Date,
+         dgs10 = `%`) %>%
+  mutate(date = ym(date))
+```
+
+
 ## Pull FRED Data
 ```{r}
 fred_data <- c("MORTGAGE30US", 
@@ -97,6 +146,7 @@ pull_series <- function(x, startDate = as.Date("1970-01-01"),
 
 macroeconomic_data <- purrr::map_dfr(fred_data, pull_series)
 ```
+
 
 
 ## Reshape Data
@@ -128,29 +178,25 @@ mortgage_rate %>%
 
 # fed fund rate
 ffr <- data_cleaned %>% 
-    select(date, dff) %>%
-      add_row(date = ymd('2022-12-01'), dff = 4.4) %>%
-      add_row(date = ymd('2023-12-01'), dff = 4.6) %>%
-      add_row(date = ymd('2024-12-01'), dff = 3.9) %>%
-      add_row(date = ymd('2025-12-01'), dff = 2.9) %>%
-      arrange(date) %>%
-      pad_by_time(.date_var = date, .by = "month", .pad_value = NA) %>%
-      mutate(dff = ts_impute_vec(dff, period = 12))
+  select(date, dff) %>%
+  add_row(date = ymd('2022-12-01'), dff = 4.4) %>%
+  add_row(date = ymd('2023-12-01'), dff = 4.6) %>%
+  add_row(date = ymd('2024-12-01'), dff = 3.9) %>%
+  add_row(date = ymd('2025-12-01'), dff = 2.9) %>%
+  arrange(date) %>%
+  pad_by_time(.date_var = date, .by = "month", .pad_value = NA) %>%
+  mutate(dff = ts_impute_vec(dff, period = 12))
     
 
 ffr %>%
   plot_time_series(date, dff, .title = "FFR Actuals+Forecast")
 
 
-# 10-year treasuries: forecast from https://econforecasting.com/forecast-t10y
+# 10-year treasuries
 treasury <- data_cleaned %>% 
   select(date, dgs10) %>%
-  filter(date < '2022-10-01') %>%
-  add_row(date = ymd('2022-12-01'), dgs10 = 4.23) %>%
-  add_row(date = ymd('2023-06-01'), dgs10 = 5.08) %>%
-  add_row(date = ymd('2023-12-01'), dgs10 = 4.71) %>%
-  add_row(date = ymd('2024-12-01'), dgs10 = 3.87) %>%
-  add_row(date = ymd('2025-12-01'), dgs10 = 3.66) %>%
+  drop_na() %>%
+  bind_rows(dgs10_forecast) %>%
   arrange(date) %>%
   pad_by_time(.date_var = date, .by = "month", .pad_value = NA) %>%
   mutate(dgs10 = ts_impute_vec(dgs10, period = 12))
