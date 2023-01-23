@@ -99,6 +99,10 @@ market_consensus$clickElement()
 # find buttons and click download (2 element)
 download_button <- remDr$findElement(using = 'xpath', '(//button[@aria-controls = "table-int"])[2]')
 download_button$clickElement()
+
+
+# sleep, as to give download time to finish.
+Sys.sleep(10)
 ```
 
 
@@ -125,7 +129,7 @@ dgs10_forecast <- read_csv("00_data/10 Year Treasury Yield Forecast  Economic Fo
 ```
 
 
-## Pull FRED Data
+## FRED Monthly Data
 ```{r}
 fred_data <- c("MORTGAGE30US", 
                "DFF",
@@ -147,6 +151,31 @@ pull_series <- function(x, startDate = as.Date("1970-01-01"),
 macroeconomic_data <- purrr::map_dfr(fred_data, pull_series)
 ```
 
+
+
+## FRED Annual Data
+```{r}
+fred_data_annual <- c("FEDTARMD")
+
+# Get Data from FRED
+pull_series_annual <- function(x, startDate = today(),
+                          endDate = end_date_forecast,
+                          frequency_ind = "a",
+                          agg_type = "avg") {
+  df <- fredr(series_id = x,
+  observation_start = startDate,
+  observation_end = endDate,
+  frequency = frequency_ind,
+  aggregation_method = agg_type
+  )
+}
+
+macroeconomic_data_annual <- purrr::map_dfr(fred_data_annual, pull_series_annual) %>%
+  mutate(date = ceiling_date(date, "year") - months(1),
+         dff  = value) %>%
+  select(date, dff)
+  
+```
 
 
 ## Reshape Data
@@ -179,10 +208,7 @@ mortgage_rate %>%
 # fed fund rate
 ffr <- data_cleaned %>% 
   select(date, dff) %>%
-  add_row(date = ymd('2022-12-01'), dff = 4.4) %>%
-  add_row(date = ymd('2023-12-01'), dff = 4.6) %>%
-  add_row(date = ymd('2024-12-01'), dff = 3.9) %>%
-  add_row(date = ymd('2025-12-01'), dff = 2.9) %>%
+  bind_rows(macroeconomic_data_annual) %>%
   arrange(date) %>%
   pad_by_time(.date_var = date, .by = "month", .pad_value = NA) %>%
   mutate(dff = ts_impute_vec(dff, period = 12))
